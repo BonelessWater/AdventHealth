@@ -2,3 +2,6 @@ python-dotenv
 openai==0.28
 pandas
 numpy
+scikit-learn
+smtplib
+nltk

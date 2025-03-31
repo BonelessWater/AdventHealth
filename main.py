@@ -1,134 +1,168 @@
 import os
-import random
 import pandas as pd
-from dotenv import load_dotenv
+import uuid
+import argparse
 import openai
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+import numpy as np
 
-# Load environment variables from the .env file
-load_dotenv()
+# Text analysis imports
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
 
-# OpenAI API key
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY is not set in the environment.")
-openai.api_key = openai_api_key
+# Import the example email for formatting reference
+from example import example_email
+EXAMPLE_EMAIL = example_email
 
-# SMTP configuration
-smtp_host = "smtp.gmail.com"
-smtp_port = 587
-smtp_username = os.getenv("SMTP_USERNAME")
-smtp_password = os.getenv("SMTP_PASSWORD")
-sender_email = os.getenv("SENDER_EMAIL")
-receiver_email = os.getenv("RECEIVER_EMAIL")
+def summarize_data(df):
+    # --- Numeric Summary (Concise) ---
+    numeric_col = df.columns[0]  # Assumes first column holds dollar amounts.
+    numeric_mean = df[numeric_col].mean()
+    numeric_min = df[numeric_col].min()
+    numeric_max = df[numeric_col].max()
+    numeric_summary = f"{numeric_col}: mean={numeric_mean:.2f}, min={numeric_min}, max={numeric_max}"
 
-for x in [smtp_host, smtp_username, smtp_password, sender_email, receiver_email]:
-    print(x)
+    # --- Raw Data Overview ---
+    raw_overview = f"Dataset: {df.shape[0]} rows, {df.shape[1]} cols. Example row: {df.iloc[0].to_dict()}"
 
-# Sample hospital names and branch names
-hospitals = [
-    "General Hospital", 
-    "St. Mary's Hospital", 
-    "City Hospital", 
-    "County Medical Center", 
-    "Regional Hospital"
-]
-
-branches = [
-    "North Wing", 
-    "South Wing", 
-    "East Wing", 
-    "West Wing", 
-    "Central"
-]
-
-# Dictionary of Nelson rules and their descriptions.
-nelson_rules = {
-    "Rule 1": "One point is more than 3 standard deviations from the mean.",
-    "Rule 2": "Nine or more consecutive points on the same side of the mean.",
-    "Rule 3": "Six consecutive points steadily increasing or decreasing.",
-    "Rule 4": "Fourteen consecutive points alternating up and down.",
-    "Rule 5": "Two out of three consecutive points are more than 2 standard deviations from the mean on the same side.",
-    "Rule 6": "Four out of five consecutive points are more than 1 standard deviation from the mean on the same side.",
-    "Rule 7": "Fifteen consecutive points fall within 1 standard deviation of the mean.",
-    "Rule 8": "Eight consecutive points are more than 1 standard deviation from the mean, with none within 1 SD."
-}
-
-# Generate sample DataFrame data
-num_rows = 10
-data = []
-for _ in range(num_rows):
-    rule = random.choice(list(nelson_rules.keys()))
-    hospital = random.choice(hospitals)
-    branch = random.choice(branches)
-    transaction = random.randint(1000, 9999)  # Random transaction ID
-    description = nelson_rules[rule]
+    # --- Frequency Analysis for String Columns (Top 2 per column) ---
+    freq_summary = ""
+    for col in df.columns[1:]:
+        top_vals = df[col].value_counts().head(2).to_dict()
+        freq_summary += f"{col}: {top_vals}; "
     
-    data.append({
-        "Rule": rule,
-        "Hospital": hospital,
-        "Branch": branch,
-        "Transaction": transaction,
-        "Description": description
-    })
+    # --- Group-By Aggregation if "Department" exists ---
+    if "Department" in df.columns:
+        group_df = df.groupby("Department")[numeric_col].agg(['mean', 'sum']).reset_index().head(2)
+        group_summary = group_df.to_string(index=False)
+    else:
+        group_summary = "No Department column."
 
-df = pd.DataFrame(data)
+    # --- Text Analysis on String Columns ---
+    # Combine text from all string columns (limit to 1000 rows)
+    text_data = df[df.columns[1:]].astype(str).agg(" ".join, axis=1).head(1000)
+    
+    # Keyword Extraction using CountVectorizer (Top 10 keywords)
+    vectorizer = CountVectorizer(stop_words='english', max_features=10)
+    X = vectorizer.fit_transform(text_data)
+    keywords = vectorizer.get_feature_names_out()
+    keyword_summary = "Keywords: " + ", ".join(keywords)
+    
+    # Topic Modeling using LDA (3 topics, Top 3 words per topic)
+    lda = LatentDirichletAllocation(n_components=3, random_state=42)
+    lda.fit(X)
+    
+    def get_topics(model, vec, n_top=3):
+        topics = []
+        feature_names = vec.get_feature_names_out()
+        for topic in model.components_:
+            top_indices = topic.argsort()[-n_top:][::-1]
+            topics.append(", ".join(feature_names[i] for i in top_indices))
+        return topics
+    
+    topics = get_topics(lda, vectorizer)
+    topic_summary = "; ".join([f"Topic {i+1}: {t}" for i, t in enumerate(topics)])
+    
+    # Sentiment Analysis using NLTK VADER on the text sample
+    nltk.download('vader_lexicon', quiet=True)
+    sia = SentimentIntensityAnalyzer()
+    sentiments = text_data.apply(lambda x: sia.polarity_scores(x))
+    avg_sentiment = pd.DataFrame(list(sentiments)).mean().to_dict()
+    sentiment_summary = f"Avg Sentiment: {avg_sentiment}"
 
-# Construct the prompt for ChatGPT
-prompt = f"""
-You are an experienced data analyst and communications specialist. I have a DataFrame containing quality control events, where each record has the following fields:
+    # Combine all into one concise summary string
+    final_summary = (
+        f"Raw Overview: {raw_overview}\n"
+        f"Numeric Summary: {numeric_summary}\n"
+        f"Frequency Summary: {freq_summary}\n"
+        f"Group Summary: {group_summary}\n"
+        f"{keyword_summary}\n"
+        f"Topic Summary: {topic_summary}\n"
+        f"{sentiment_summary}"
+    )
+    return final_summary
 
-- Rule: The specific Nelson rule that was broken.
-- Hospital: The name of the hospital.
-- Branch: The branch location.
-- Transaction: A unique transaction ID.
-- Description: A detailed description of the broken rule.
+def main(args):
+    # Load environment variables
+    load_dotenv()
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise ValueError("OPENAI_API_KEY is not set.")
+    openai.api_key = openai_api_key
 
-Below is the DataFrame data:
+    # SMTP configuration
+    smtp_host = "smtp.gmail.com"
+    smtp_port = 587
+    smtp_username = os.getenv("SMTP_USERNAME")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    sender_email = os.getenv("SENDER_EMAIL")
+    receiver_email = os.getenv("RECEIVER_EMAIL")
+    
+    for var in [smtp_host, smtp_username, smtp_password, sender_email, receiver_email]:
+        print(var)
+    
+    # Read the anomaly data
+    df = pd.read_csv("ANOMALY_TABLE.csv")
+    data_summary = summarize_data(df)
 
-{df.to_string(index=False)}
+    # Construct a concise prompt
+    concise_prompt = f"""
+You are an experienced data analyst and communications specialist. The dataset contains hospital finance anomalies.
+Summary:
+{data_summary}
 
-Please analyze this DataFrame to identify any significant trends, anomalies, or patterns—such as frequently occurring rules or issues concentrated in specific hospitals or branches. Based on your analysis, draft a professional email addressed to senior management that summarizes the key findings and includes any recommendations or next steps.
+Draft a professional email to senior management that:
+- Has a clear subject line (e.g., "Important Findings on Hospital Finances"),
+- Contains a professional greeting,
+- Provides a concise overview of the key findings (using bullet points as needed),
+- Lists actionable recommendations,
+- Ends with a professional closing.
 
-The email should include:
-- A clear subject line (e.g., "Important Findings on Quality Control Metrics").
-- A professional greeting.
-- A concise overview of the analysis and significant observations, using bullet points if necessary.
-- Any actionable recommendations or next steps.
-- A professional closing.
-
-Please ensure the tone is formal and appropriate for communicating critical quality control issues to a senior audience.
+Use the following example for reference:
+{EXAMPLE_EMAIL}
 """
+    
+    # Call the OpenAI ChatCompletion API
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": concise_prompt}
+        ]
+    )
+    
+    generated_email = response.choices[0].message['content']
+    print("Generated Email:\n", generated_email)
+    
+    if args.debug:
+        # Write output to a file with a UUID-based filename in debug mode
+        filename = f"outputs/{uuid.uuid4()}.txt"
+        with open(filename, "w") as f:
+            f.write(generated_email)
+        print(f"Debug mode enabled. Email content written to file: {filename}")
+    else:
+        # Prepare and send the email via SMTP
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = receiver_email
+        msg["Subject"] = "Important Findings on Hospital Finances"
+        msg.attach(MIMEText(generated_email, "plain"))
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_username, smtp_password)
+                server.send_message(msg)
+            print("Email sent successfully!")
+        except Exception as e:
+            print("Error sending email:", e)
 
-# Call the OpenAI ChatCompletion API to generate the email content
-response = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": prompt}
-    ]
-)
-
-email_content = response.choices[0].message['content']
-print("Generated Email:\n")
-print(email_content)
-
-# Prepare the email message using MIME
-msg = MIMEMultipart()
-msg["From"] = sender_email
-msg["To"] = receiver_email
-msg["Subject"] = "Important Findings on Quality Control Metrics"  # You can modify the subject if needed
-
-msg.attach(MIMEText(email_content, "plain"))
-
-# Send the email using SMTP
-try:
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()  # Secure the connection
-        server.login(smtp_username, smtp_password)
-        server.send_message(msg)
-    print("Email sent successfully!")
-except Exception as e:
-    print("Error sending email:", e)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Generate and send hospital finance anomaly email")
+    parser.add_argument('--debug', action='store_true', help="If set, do not send email; output to a text file instead.")
+    args = parser.parse_args()
+    main(args)

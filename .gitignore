@@ -1,2 +1,9 @@
 .env
 venv
+
+__pycache__
+
+# Priviledged information
+ANOMALY_TABLE.csv
+outputs/
+example.py
